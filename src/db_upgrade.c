@@ -1667,6 +1667,7 @@ static const struct db_upgrade_query db_upgrade_v1909_queries[] =
     { U_V1909_SCVER_MINOR,    "set schema_version_minor to 09" },
   };
 
+
 // Clean up after bug in commit fde0a281 (schema 19.09)
 #define U_V1910_CLEANUP_TIME_SKIPPED \
   "UPDATE files SET time_skipped = 0 WHERE time_skipped > 2000000000;"
@@ -1680,6 +1681,7 @@ static const struct db_upgrade_query db_upgrade_v1910_queries[] =
 
     { U_V1910_SCVER_MINOR,    "set schema_version_minor to 10" },
   };
+
 
 #define U_v1911_ALTER_QUEUE_ADD_COMPOSER \
   "ALTER TABLE queue ADD COLUMN composer VARCHAR(1024) DEFAULT NULL;"
@@ -1695,6 +1697,49 @@ static const struct db_upgrade_query db_upgrade_v1911_queries[] =
 
     { U_v1911_SCVER_MAJOR,    "set schema_version_major to 19" },
     { U_v1911_SCVER_MINOR,    "set schema_version_minor to 11" },
+  };
+
+
+#define U_V2000_DROP_TRG1							\
+  "DROP TRIGGER update_groups_new_file;"
+#define U_V2000_DROP_TRG2							\
+  "DROP TRIGGER update_groups_update_file;"
+#define U_V2000_TRG1								\
+  "CREATE TRIGGER trg_files_insert_songids AFTER INSERT ON files FOR EACH ROW"	\
+  " BEGIN"									\
+  "   UPDATE files SET songartistid = daap_songalbumid(LOWER(NEW.album_artist), ''), "	\
+  "     songalbumid = daap_songalbumid(LOWER(NEW.album_artist), LOWER(NEW.album))"	\
+  "   WHERE id = NEW.id;"							\
+  " END;"
+#define U_V2000_TRG2								\
+  "CREATE TRIGGER trg_files_update_songids AFTER UPDATE OF album_artist, album ON files FOR EACH ROW"	\
+  " BEGIN"									\
+  "   UPDATE files SET songartistid = daap_songalbumid(LOWER(NEW.album_artist), ''), "	\
+  "     songalbumid = daap_songalbumid(LOWER(NEW.album_artist), LOWER(NEW.album))"	\
+  "   WHERE id = NEW.id;"							\
+  " END;"
+#define U_V2000_TRG3								\
+  "CREATE TRIGGER trg_groups_update AFTER UPDATE OF songartistid, songalbumid ON files FOR EACH ROW"	\
+  " BEGIN"									\
+  "   INSERT OR IGNORE INTO groups (type, name, persistentid) VALUES (1, NEW.album, NEW.songalbumid);"	\
+  "   INSERT OR IGNORE INTO groups (type, name, persistentid) VALUES (2, NEW.album_artist, NEW.songartistid);"	\
+  " END;"
+
+#define U_V2000_SCVER_MAJOR \
+  "UPDATE admin SET value = '20' WHERE key = 'schema_version_major';"
+#define U_V2000_SCVER_MINOR \
+  "UPDATE admin SET value = '00' WHERE key = 'schema_version_minor';"
+
+static const struct db_upgrade_query db_upgrade_v2000_queries[] =
+  {
+    { U_V2000_DROP_TRG1,      "drop trigger update_groups_new_file" },
+    { U_V2000_DROP_TRG2,      "drop trigger update_groups_update_file" },
+    { U_V2000_TRG1,           "create trigger trg_files_insert_songids" },
+    { U_V2000_TRG2,           "create trigger trg_files_update_songids" },
+    { U_V2000_TRG3,           "create trigger trg_groups_update" },
+
+    { U_V2000_SCVER_MAJOR,    "set schema_version_major to 20" },
+    { U_V2000_SCVER_MINOR,    "set schema_version_minor to 00" },
   };
 
 
@@ -1882,6 +1927,14 @@ db_upgrade(sqlite3 *hdl, int db_ver)
 
     case 1910:
       ret = db_generic_upgrade(hdl, db_upgrade_v1911_queries, ARRAY_SIZE(db_upgrade_v1911_queries));
+      if (ret < 0)
+	return -1;
+      break;
+
+      /* FALLTHROUGH */
+
+    case 1911:
+      ret = db_generic_upgrade(hdl, db_upgrade_v2000_queries, ARRAY_SIZE(db_upgrade_v2000_queries));
       if (ret < 0)
 	return -1;
       break;
