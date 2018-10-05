@@ -62,7 +62,8 @@
 #define DB_TYPE_INT      2
 #define DB_TYPE_INT64    3
 #define DB_TYPE_STRING   4
-#define DB_F_TYPE_AUTO   (1 << 8)
+
+#define DB_FLAG_AUTO     1 // Flags that column value is set automatically by the db, e.g. by a trigger
 
 enum group_type {
   G_ALBUMS = 1,
@@ -86,6 +87,7 @@ struct col_type_map {
   char *name;
   ssize_t offset;
   short type;
+  short flag;
 };
 
 struct query_clause {
@@ -108,7 +110,7 @@ struct browse_clause {
  */
 static const struct col_type_map mfi_cols_map[] =
   {
-    { "id",                 mfi_offsetof(id),                 DB_TYPE_INT | DB_F_TYPE_AUTO },
+    { "id",                 mfi_offsetof(id),                 DB_TYPE_INT, DB_FLAG_AUTO },
     { "path",               mfi_offsetof(path),               DB_TYPE_STRING },
     { "fname",              mfi_offsetof(fname),              DB_TYPE_STRING },
     { "title",              mfi_offsetof(title),              DB_TYPE_STRING },
@@ -158,8 +160,8 @@ static const struct col_type_map mfi_cols_map[] =
     { "tv_network_name",    mfi_offsetof(tv_network_name),    DB_TYPE_STRING },
     { "tv_episode_sort",    mfi_offsetof(tv_episode_sort),    DB_TYPE_INT },
     { "tv_season_num",      mfi_offsetof(tv_season_num),      DB_TYPE_INT },
-    { "songartistid",       mfi_offsetof(songartistid),       DB_TYPE_INT64 | DB_F_TYPE_AUTO },
-    { "songalbumid",        mfi_offsetof(songalbumid),        DB_TYPE_INT64 | DB_F_TYPE_AUTO },
+    { "songartistid",       mfi_offsetof(songartistid),       DB_TYPE_INT64, DB_FLAG_AUTO },
+    { "songalbumid",        mfi_offsetof(songalbumid),        DB_TYPE_INT64, DB_FLAG_AUTO },
     { "title_sort",         mfi_offsetof(title_sort),         DB_TYPE_STRING },
     { "artist_sort",        mfi_offsetof(artist_sort),        DB_TYPE_STRING },
     { "album_sort",         mfi_offsetof(album_sort),         DB_TYPE_STRING },
@@ -178,7 +180,7 @@ static const struct col_type_map mfi_cols_map[] =
  */
 static const struct col_type_map pli_cols_map[] =
   {
-    { "id",                 pli_offsetof(id),           DB_TYPE_INT | DB_F_TYPE_AUTO },
+    { "id",                 pli_offsetof(id),           DB_TYPE_INT, DB_FLAG_AUTO },
     { "title",              pli_offsetof(title),        DB_TYPE_STRING },
     { "type",               pli_offsetof(type),         DB_TYPE_INT },
     { "query",              pli_offsetof(query),        DB_TYPE_STRING },
@@ -313,7 +315,7 @@ static const ssize_t dbgri_cols_map[] =
  */
 static const struct col_type_map wi_cols_map[] =
   {
-    { "wd",          wi_offsetof(wd),     DB_TYPE_INT | DB_F_TYPE_AUTO },
+    { "wd",          wi_offsetof(wd),     DB_TYPE_INT, DB_FLAG_AUTO },
     { "cookie",      wi_offsetof(cookie), DB_TYPE_INT },
     { "path",        wi_offsetof(path),   DB_TYPE_STRING },
   };
@@ -425,7 +427,6 @@ static bool db_rating_updates;
 
 static __thread sqlite3 *hdl;
 static __thread struct db_statements db_statements;
-static bool db_schema_is_created;
 
 
 /* Forward */
@@ -1000,7 +1001,7 @@ bind_mfi(sqlite3_stmt *stmt, struct media_file_info *mfi)
 
   for (i = 0, n = 1; i < ARRAY_SIZE(mfi_cols_map); i++)
     {
-      if (mfi_cols_map[i].type & DB_F_TYPE_AUTO)
+      if (mfi_cols_map[i].flag == DB_FLAG_AUTO)
 	continue;
 
       ptr = (char *)mfi + mfi_cols_map[i].offset;
@@ -1128,15 +1129,19 @@ db_blocking_prepare_v2(const char *query, int len, sqlite3_stmt **stmt, const ch
 static int
 db_statement_run(sqlite3_stmt *stmt)
 {
-  char *query;
   int ret;
 
+#ifdef HAVE_SQLITE3_EXPANDED_SQL
+  char *query;
   if (logger_severity() >= E_DBG)
     {
       query = sqlite3_expanded_sql(stmt);
       DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
       sqlite3_free(query);
     }
+#else
+  DPRINTF(E_DBG, L_DB, "Running query (prepared statement)\n");
+#endif
 
   while ((ret = db_blocking_step(stmt)) == SQLITE_ROW)
     ; /* EMPTY */
@@ -2505,34 +2510,11 @@ db_file_ping(int id)
 int
 db_file_ping_bypath(const char *path, time_t mtime_max)
 {
-  sqlite3_stmt *stmt = db_statements.files_ping;
-  char *query;
-  int ret;
+  sqlite3_bind_int64(db_statements.files_ping, 1, (int64_t)time(NULL));
+  sqlite3_bind_text(db_statements.files_ping, 2, path, -1, SQLITE_STATIC);
+  sqlite3_bind_int64(db_statements.files_ping, 3, (int64_t)mtime_max);
 
-  sqlite3_clear_bindings(stmt);
-
-  sqlite3_bind_int64(stmt, 1, (int64_t)time(NULL));
-  sqlite3_bind_text(stmt, 2, path, -1, SQLITE_STATIC);
-  sqlite3_bind_int64(stmt, 3, (int64_t)mtime_max);
-
-  if (logger_severity() >= E_DBG)
-    {
-      query = sqlite3_expanded_sql(stmt);
-      DPRINTF(E_DBG, L_DB, "Running query '%s'\n", query);
-      sqlite3_free(query);
-    }
-
-  ret = db_blocking_step(stmt);
-  if (ret != SQLITE_DONE)
-    {
-      DPRINTF(E_LOG, L_DB, "Could not step: %s\n", sqlite3_errmsg(hdl));
-      sqlite3_reset(stmt);
-      return -1;
-    }
-
-  sqlite3_reset(stmt);
-
-  return sqlite3_changes(hdl);
+  return db_statement_run(db_statements.files_ping);
 }
 
 void
@@ -2812,7 +2794,7 @@ db_file_fetch_byquery(char *query)
 
   for (i = 0; i < ARRAY_SIZE(mfi_cols_map); i++)
     {
-      switch (mfi_cols_map[i].type & ~DB_F_TYPE_AUTO)
+      switch (mfi_cols_map[i].type)
 	{
 	  case DB_TYPE_CHAR:
 	    cval = (char *)mfi + mfi_cols_map[i].offset;
@@ -3310,7 +3292,7 @@ db_pl_fetch_byquery(const char *query)
 
   for (i = 0; i < ARRAY_SIZE(pli_cols_map); i++)
     {
-      switch (pli_cols_map[i].type & ~DB_F_TYPE_AUTO)
+      switch (pli_cols_map[i].type)
 	{
 	  case DB_TYPE_INT:
 	    ival = (uint32_t *) ((char *)pli + pli_cols_map[i].offset);
@@ -6104,7 +6086,7 @@ db_watch_get_byquery(struct watch_info *wi, char *query)
 
   for (i = 0; i < ARRAY_SIZE(wi_cols_map); i++)
     {
-      switch (wi_cols_map[i].type & ~DB_F_TYPE_AUTO)
+      switch (wi_cols_map[i].type)
 	{
 	  case DB_TYPE_INT:
 	    ival = (uint32_t *) ((char *)wi + wi_cols_map[i].offset);
@@ -6663,97 +6645,7 @@ db_pragma_set_mmap_size(int mmap_size)
 }
 
 static int
-db_statements_prepare(void)
-{
-  char *query;
-  char keystr[2048];
-  char valstr[1024];
-  int keyremain;
-  int valremain;
-  int ret;
-  int i;
-
-  // Prepare "INSERT INTO files" statement
-  keyremain = sizeof(keystr);
-  valremain = sizeof(valstr);
-  for (i = 0; i < ARRAY_SIZE(mfi_cols_map); i++)
-    {
-      if (mfi_cols_map[i].type & DB_F_TYPE_AUTO)
-	continue;
-
-      keyremain -= snprintf(keystr + sizeof(keystr) - keyremain, keyremain, "%s, ", mfi_cols_map[i].name);
-      valremain -= snprintf(valstr + sizeof(valstr) - valremain, valremain, "?, ");
-      if (keyremain <= 0 || valremain <= 0)
-	{
-	  DPRINTF(E_FATAL, L_DB, "Bug! Size of keystr or valstr is insufficient (%d, %d)\n", keyremain, valremain);
-	  return -1;
-	}
-    }
-
-  // Terminates at the ending ", "
-  keystr[sizeof(keystr) - keyremain - 2] = '\0';
-  valstr[sizeof(valstr) - valremain - 2] = '\0';
-
-  CHECK_NULL(L_DB, query = db_mprintf("INSERT INTO files (%s) VALUES (%s);", keystr, valstr));
-
-  ret = db_blocking_prepare_v2(query, -1, &db_statements.files_insert, NULL);
-  if (ret != SQLITE_OK)
-    {
-      DPRINTF(E_FATAL, L_DB, "Could not prepare statement '%s': %s\n", query, sqlite3_errmsg(hdl));
-      free(query);
-      return -1;
-    }
-
-  free(query);
-
-  // Prepare "UPDATE files" statement
-  keyremain = sizeof(keystr);
-  for (i = 0; i < ARRAY_SIZE(mfi_cols_map); i++)
-    {
-      if (mfi_cols_map[i].type & DB_F_TYPE_AUTO)
-	continue;
-
-      keyremain -= snprintf(keystr + sizeof(keystr) - keyremain, keyremain, "%s = ?, ", mfi_cols_map[i].name);
-      if (keyremain <= 0)
-	{
-	  DPRINTF(E_FATAL, L_DB, "Bug! Size of keystr is insufficient (%d)\n", keyremain);
-	  return -1;
-	}
-    }
-
-  // Terminates at the ending ", "
-  keystr[sizeof(keystr) - keyremain - 2] = '\0';
-
-  CHECK_NULL(L_DB, query = db_mprintf("UPDATE files SET %s WHERE %s = ?;", keystr, mfi_cols_map[0].name));
-
-  ret = db_blocking_prepare_v2(query, -1, &db_statements.files_update, NULL);
-  if (ret != SQLITE_OK)
-    {
-      DPRINTF(E_FATAL, L_DB, "Could not prepare statement '%s': %s\n", query, sqlite3_errmsg(hdl));
-      free(query);
-      return -1;
-    }
-  free(query);
-
-  // Prepare "UPDATE files SET db_timestamp" statement
-  CHECK_NULL(L_DB, query = db_mprintf("UPDATE files SET db_timestamp = ?, disabled = 0 WHERE path = ? AND db_timestamp >= ?;"));
-
-  ret = db_blocking_prepare_v2(query, -1, &db_statements.files_ping, NULL);
-  if (ret != SQLITE_OK)
-    {
-      DPRINTF(E_FATAL, L_DB, "Could not prepare statement '%s': %s\n", query, sqlite3_errmsg(hdl));
-      free(query);
-      return -1;
-    }
-
-  free(query);
-
-  return 0;
-}
-
-
-int
-db_perthread_init(void)
+db_open(void)
 {
   char *errmsg;
   int ret;
@@ -6805,18 +6697,6 @@ db_perthread_init(void)
       return -1;
     }
 
-  if (db_schema_is_created)
-    {
-      ret = db_statements_prepare();
-      if (ret < 0)
-	{
-	  DPRINTF(E_LOG, L_DB, "Could not prepare statements\n");
-
-	  sqlite3_close(hdl);
-	  return -1;
-	}
-    }
-
 #ifdef DB_PROFILE
   sqlite3_trace_v2(hdl, SQLITE_TRACE_PROFILE, db_xprofile, NULL);
 #endif
@@ -6850,6 +6730,116 @@ db_perthread_init(void)
       db_pragma_set_mmap_size(mmap_size);
       mmap_size = db_pragma_get_mmap_size();
       DPRINTF(E_DBG, L_DB, "Database mmap_size: %d\n", mmap_size);
+    }
+
+  return 0;
+}
+
+static int
+db_statements_prepare(void)
+{
+  char *query;
+  char keystr[2048];
+  char valstr[1024];
+  int keyremain;
+  int valremain;
+  int ret;
+  int i;
+
+  // Prepare "INSERT INTO files" statement
+  keyremain = sizeof(keystr);
+  valremain = sizeof(valstr);
+  for (i = 0; i < ARRAY_SIZE(mfi_cols_map); i++)
+    {
+      if (mfi_cols_map[i].flag == DB_FLAG_AUTO)
+	continue;
+
+      keyremain -= snprintf(keystr + sizeof(keystr) - keyremain, keyremain, "%s, ", mfi_cols_map[i].name);
+      valremain -= snprintf(valstr + sizeof(valstr) - valremain, valremain, "?, ");
+      if (keyremain <= 0 || valremain <= 0)
+	{
+	  DPRINTF(E_FATAL, L_DB, "Bug! Size of keystr or valstr is insufficient (%d, %d)\n", keyremain, valremain);
+	  return -1;
+	}
+    }
+
+  // Terminates at the ending ", "
+  keystr[sizeof(keystr) - keyremain - 2] = '\0';
+  valstr[sizeof(valstr) - valremain - 2] = '\0';
+
+  CHECK_NULL(L_DB, query = db_mprintf("INSERT INTO files (%s) VALUES (%s);", keystr, valstr));
+
+  ret = db_blocking_prepare_v2(query, -1, &db_statements.files_insert, NULL);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_FATAL, L_DB, "Could not prepare statement '%s': %s\n", query, sqlite3_errmsg(hdl));
+      free(query);
+      return -1;
+    }
+
+  free(query);
+
+  // Prepare "UPDATE files" statement
+  keyremain = sizeof(keystr);
+  for (i = 0; i < ARRAY_SIZE(mfi_cols_map); i++)
+    {
+      if (mfi_cols_map[i].flag == DB_FLAG_AUTO)
+	continue;
+
+      keyremain -= snprintf(keystr + sizeof(keystr) - keyremain, keyremain, "%s = ?, ", mfi_cols_map[i].name);
+      if (keyremain <= 0)
+	{
+	  DPRINTF(E_FATAL, L_DB, "Bug! Size of keystr is insufficient (%d)\n", keyremain);
+	  return -1;
+	}
+    }
+
+  // Terminates at the ending ", "
+  keystr[sizeof(keystr) - keyremain - 2] = '\0';
+
+  CHECK_NULL(L_DB, query = db_mprintf("UPDATE files SET %s WHERE %s = ?;", keystr, mfi_cols_map[0].name));
+
+  ret = db_blocking_prepare_v2(query, -1, &db_statements.files_update, NULL);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_FATAL, L_DB, "Could not prepare statement '%s': %s\n", query, sqlite3_errmsg(hdl));
+      free(query);
+      return -1;
+    }
+  free(query);
+
+  // Prepare "UPDATE files SET db_timestamp" statement
+  CHECK_NULL(L_DB, query = db_mprintf("UPDATE files SET db_timestamp = ?, disabled = 0 WHERE path = ? AND db_timestamp >= ?;"));
+
+  ret = db_blocking_prepare_v2(query, -1, &db_statements.files_ping, NULL);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_FATAL, L_DB, "Could not prepare statement '%s': %s\n", query, sqlite3_errmsg(hdl));
+      free(query);
+      return -1;
+    }
+
+  free(query);
+
+  return 0;
+}
+
+int
+db_perthread_init(void)
+{
+  int ret;
+
+  ret = db_open();
+  if (ret < 0)
+    return -1;
+
+  ret = db_statements_prepare();
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DB, "Could not prepare statements\n");
+
+      sqlite3_close(hdl);
+      return -1;
     }
 
   return 0;
@@ -7034,9 +7024,12 @@ db_init(void)
       return -1;
     }
 
-  ret = db_perthread_init();
+  ret = db_open();
   if (ret < 0)
-    return ret;
+    {
+      DPRINTF(E_FATAL, L_DB, "Could not open database\n");
+      return -1;
+    }
 
   ret = db_check_version();
   if (ret < 0)
@@ -7058,8 +7051,6 @@ db_init(void)
 	  return -1;
 	}
     }
-
-  db_schema_is_created = true; // TODO look at better ways of doing this
 
   db_set_cfg_names();
 
